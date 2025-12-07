@@ -1,75 +1,48 @@
 import { Injectable } from '@nestjs/common';
 import { CreateTrashInfosDto } from './dto/trashInfos.dto';
-import { InfluxDB, Point } from '@influxdata/influxdb-client';
-import { log } from 'console';
+import { InfluxDBClient, Point } from '@influxdata/influxdb3-client';
 import { ConfigService } from '@nestjs/config';
-
-
 
 @Injectable()
 export class TrashInfosService {
-  private influx: InfluxDB;
-  private influxWriteApi;
-  private influxQueryApi;
-  private bucket;
-  private org;
+  private influx: InfluxDBClient;
 
   constructor(private configService: ConfigService) {
-    const url = process.env.INFLUX_URL || 'http://localhost:8086'; // URL par défaut si non défini
+    const host = process.env.INFLUX_URL || 'http://localhost:8181'; // URL par défaut si non défini
     const token = process.env.INFLUX_TOKEN || 'my-token';
-    this.bucket = process.env.INFLUX_BUCKET;
-    this.org = process.env.INFLUX_ORG;
-    console.log('Connecting to InfluxDB with URL:', url, 'Bucket:', this.bucket, 'Org:', this.org);
+    const database = process.env.INFLUX_DATABASE || 'data';
+    console.log(
+      `Connecting to InfluxDB with URL: ${host}, Database: ${database}`,
+    );
 
-    this.influx = new InfluxDB({url, token});
-    this.influxWriteApi = this.influx.getWriteApi(this.org, this.bucket);
-    this.influxQueryApi = this.influx.getQueryApi(this.org);
+    this.influx = new InfluxDBClient({ host, token, database });
   }
 
   async saveTrashInfos(data: CreateTrashInfosDto) {
-    const point = new Point('smartbin_trashInfos')
-      .tag('device_id', data.device_id)
-      .stringField('type', data.type)
-      .floatField('quantity', data.quantity)
-      .timestamp(new Date(data.timestamp));
-    this.influxWriteApi.writePoint(point);
-    await this.influxWriteApi.flush();
-    log('TrashInfos saved:', data);
+    const point = Point.measurement('smartbin_trashInfos')
+      .setTag('device_id', data.device_id)
+      .setStringField('type', data.type)
+      .setFloatField('quantity', data.quantity)
+      .setTimestamp(new Date(data.timestamp).getTime());
+
+    await this.influx.write([point], undefined, undefined, {
+      precision: 'ms',
+    });
   }
 
   async getAllTrashInfos() {
-    const fluxQuery = `
-      from(bucket: "data")
-      |> range(start: 0)
-      |> filter(fn: (r) => r["_measurement"] == "smartbin_trashInfos")
-      |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-      |> keep(columns: ["_time", "device_id", "type", "quantity"])
-    `;
+    const queryResults = this.influx.query(
+      `SELECT * FROM "smartbin_trashInfos"`,
+      undefined,
+      {
+        type: 'sql',
+      },
+    );
 
-    const result: CreateTrashInfosDto[] = [];
-    return new Promise((resolve, reject) => {
-      this.influxQueryApi.queryRows(fluxQuery, {
-        next: (row, tableMeta) => {
-          const o = tableMeta.toObject(row);
-          try {
-            result.push({
-              device_id: o.device_id,
-              type: o.type,
-              quantity: Number(o.quantity),
-              timestamp: o._time,
-            });
-          } catch (e) {
-            console.error("Erreur lors du parsing d'une ligne:", e, o);
-          }
-        },
-        error: (error) => {
-          console.error('Erreur dans queryRows:', error);
-          reject(error);
-        },
-        complete: () => {
-          resolve(result);
-        },
-      });
-    });
+    const results: CreateTrashInfosDto[] = [];
+    for await (const row of queryResults) {
+      results.push(row as CreateTrashInfosDto);
+    }
+    return results;
   }
 }
